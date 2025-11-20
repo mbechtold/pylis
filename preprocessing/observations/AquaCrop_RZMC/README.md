@@ -32,7 +32,7 @@ Adjust `LIS_OL_SMAP_L2.slurm` (email, paths to compiled code, other paths, etc.)
 
 ## 3. Optimize Exponential Filter and Generate RZMC Observation Files
 Obtain the Python scripts for the exponential filter from:
-[https://github.com/mbechtold/pylis/preprocessing/observations/AquaCrop_RZMC/](https://github.com/mbechtold/pylis/preprocessing/observations/AquaCrop_RZMC/)
+[https://github.com/mbechtold/pylis/tree/main/preprocessing/observations/AquaCrop_RZMC](https://github.com/mbechtold/pylis/tree/main/preprocessing/observations/AquaCrop_RZMC/)
 
 Navigate to the EXP_FILTER directory:
 ```bash
