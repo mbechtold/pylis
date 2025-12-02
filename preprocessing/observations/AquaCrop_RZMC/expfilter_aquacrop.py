@@ -12,12 +12,27 @@ satellite surface soil moisture in DAOBS and AquaCrop soil moisture in SURFACEMO
   out rzmc_all[t, :, :] per day into NetCDF files.
 
 Gap / stabilization policy:
-  - If a pixel has > 7 consecutive days with missing input, the *entire gap*
-    (from its start) is forced to NaN retroactively.
-  - When valid data resumes after such a long 7 day gap, the *next 30 days* are NaN.
-  - After the first-ever valid input for a pixel, the *first 30 days* are NaN.
+
+  - For gaps **shorter than tau** (in days, per pixel):
+      * the filter uses the Wagner-form EMA and **holds y across missing inputs** 
+        (i.e., the state is persisted during the gap).
+      * no retroactive masking is applied; these “short gaps” behave like in the
+        simpler “hold y on NaNs” approach.
+
+  - For gaps **longer than tau**:
+      * the entire gap (from its start) is retroactively forced to NaN.
+      * when valid data resumes after such a long gap, we apply a stabilization
+        window whose length depends on tau (as before).
+      * this keeps the original “long gap” policy but with a threshold tied to
+        tau instead of a fixed number of days.
+
   - After filtering, all days with missing SMAP input are forced to NaN, i.e.
-    time resolution is not artificially increased by the filtering
+    time resolution is not artificially increased by the filtering.
+
+The EMA uses the Wagner et al. (1999) SWI formulation:
+
+  w = exp(-Δt / τ)
+  y_t = w * y_{t-1} + (1 - w) * x_t
 
 Inputs:
   - --exp_folder        : root of the LIS/SHUI experiment (contains /output)
@@ -28,12 +43,12 @@ Inputs:
   - --rz_layers         : root-zone selection (e.g., 1-3, 1-6, 1-10, all)
   - --depth_cm          : target depth for metadata
   - --model             : tag in daily filenames
-  - --moving_window     : moving-window length (days) for CDF matching (default 45)
+  - --moving_window     : moving-window length (days) for CDF matching (default 30)
   - --outdir_timeseries : subdirectory for daily NetCDF files
 
 CDF policy:
   - climatological moving window:
-    * window length = --moving_window (days, default 45)
+    * window length = --moving_window (days, default 30)
     * window step   = 10 days in day-of-year space
     * windows are circular in day-of-year, so the beginning and end of the year
       are covered symmetrically.
@@ -46,7 +61,7 @@ python /data/leuven/317/vsc31786/python/zdenko/expfilter_aquacrop.py \
   --outdir_timeseries SMAP_RZMC_30CM_AC72_MONTHLY \
   --rz_layers 1-6 \
   --depth_cm 60 \
-  --moving_window 45 \
+  --moving_window 30 \
   --start_date 01/04/2015 \
   --end_date 31/12/2022
 """
@@ -179,122 +194,64 @@ def _parse_rz_layers(spec, layer_coords):
 
 
 # ====================================================
-# Gap / stabilization policy
+# Gap / stabilization policy + EMA
 # ====================================================
 
-GAP_THRESHOLD = 7     # days of consecutive missing inputs → "long gap"
-STABILIZE_DAYS = 30   # days of NaNs after first valid / after long gap
+def get_stabilize_days(tau_days, min_days=5, max_days=60):
+    """
+    Map tau (days) to a stabilization window length (days).
+
+    - For scalar tau: returns an int.
+    - For array tau: returns an int array of the same shape.
+    """
+    tau_arr = np.asarray(tau_days, dtype=float)
+    stab = np.zeros_like(tau_arr, dtype=np.int32)
+    valid = np.isfinite(tau_arr) & (tau_arr > 0)
+    if np.any(valid):
+        # here we simply tie the window to tau itself (1 * tau), with bounds
+        stab_val = np.round(tau_arr[valid]).astype(int)
+        stab_val = np.clip(stab_val, min_days, max_days)
+        stab[valid] = stab_val
+    return stab
 
 
 def exp_filter_ema_step(prev_y, x_now, dt_days, tau_days):
-    """Single-step EMA update with K = Δt / (τ + Δt)."""
+    """
+    Single-step EMA update using the Wagner SWI form:
+
+        w = exp(-Δt / τ)
+        y_t = w * y_{t-1} + (1 - w) * x_t
+    """
     if not np.isfinite(tau_days) or tau_days <= 0:
-        return np.nan
+        return prev_y
     dt = max(1.0, float(dt_days))
     if np.isnan(prev_y):
         return x_now if np.isfinite(x_now) else np.nan
     if not np.isfinite(x_now):
         return prev_y
-    K = dt / (float(tau_days) + dt)
-    return prev_y + K * (x_now - prev_y)
-
-
-def enforce_gap_and_stabilization(
-    y_store,
-    t,
-    x_t,
-    tau_np,
-    y_prev,
-    time_index,
-    gap_run,
-    gap_start_idx,
-    stabilize_left,
-    has_seen_valid,
-):
-    """
-    Apply EMA step for all pixels and write into y_store[t, :, :] while enforcing:
-      - Long gap (>GAP_THRESHOLD): set entire gap to NaN retroactively.
-      - After long gap ends: STABILIZE_DAYS NaNs.
-      - After first-ever valid input: STABILIZE_DAYS NaNs.
-    """
-    nlat, nlon = y_prev.shape
-
-    # Δt in days
-    if t == 0:
-        dt_days = 1.0
-    else:
-        dt_days = (
-            np.datetime64(time_index[t], "D") - np.datetime64(time_index[t - 1], "D")
-        ).astype(int)
-        dt_days = float(dt_days) if dt_days >= 1 else 1.0
-
-    valid_tau = np.isfinite(tau_np) & (tau_np > 0)
-    y_now = y_prev.copy()
-
-    is_valid_x = np.isfinite(x_t)
-    is_missing_x = ~is_valid_x
-
-    # Missing inputs → update gap trackers
-    gap_run[is_missing_x] += 1
-    just_started = (gap_run == 1) & is_missing_x
-    gap_start_idx[just_started] = t
-
-    # Long gap in progress → retroactively null entire gap
-    long_gap = (gap_run >= (GAP_THRESHOLD + 1)) & is_missing_x
-    if np.any(long_gap):
-        jj, ii = np.where(long_gap)
-        for j, i in zip(jj, ii):
-            gs = int(gap_start_idx[j, i])
-            if gs >= 0:
-                y_store[gs : (t + 1), j, i] = np.nan
-
-    # EMA update where input valid
-    up_mask = valid_tau & is_valid_x
-    if np.any(up_mask):
-        K = dt_days / (np.maximum(tau_np[up_mask], 1e-6) + dt_days)
-        y_now[up_mask] = np.where(
-            np.isnan(y_prev[up_mask]),
-            x_t[up_mask],
-            y_prev[up_mask] + K * (x_now[up_mask] - y_prev[up_mask]),
-        )
-
-    # If we just ended a gap and it was long → stabilize window
-    ended_gap = up_mask & (gap_run > 0)
-    long_gap_ended = ended_gap & (gap_run > GAP_THRESHOLD)
-    stabilize_left[long_gap_ended] = STABILIZE_DAYS
-
-    # Reset gap counters where valid
-    gap_run[up_mask] = 0
-    gap_start_idx[up_mask] = -1
-
-    # First-ever valid
-    first_valid_today = up_mask & (~has_seen_valid)
-    stabilize_left[first_valid_today] = STABILIZE_DAYS
-    has_seen_valid[first_valid_today] = True
-
-    # Provisional write
-    y_store[t, :, :] = y_now
-
-    # While still in long gap, keep NaN
-    still_in_long_gap = (gap_run >= (GAP_THRESHOLD + 1)) & is_missing_x
-    if np.any(still_in_long_gap):
-        jj, ii = np.where(still_in_long_gap)
-        y_store[t, jj, ii] = np.nan
-
-    # Stabilization NaNs after restarts
-    stab_mask = stabilize_left > 0
-    if np.any(stab_mask):
-        jj, ii = np.where(stab_mask)
-        y_store[t, jj, ii] = np.nan
-        stabilize_left[jj, ii] -= 1
-
-    return y_now
-
+    w = np.exp(-dt / max(tau_days, 1e-6))
+    return w * prev_y + (1.0 - w) * x_now
 
 def exp_filter_ema_with_gap_1d(x, time_vals, tau_days):
     """
     1D version of EMA + gap/stabilization policy, used during tau optimization
     and for constructing 1D filtered series with the same rules.
+
+    EMA uses Wagner SWI form:
+        w = exp(-Δt / τ), y_t = w*y_{t-1} + (1-w)*x_t
+
+    Gap policy (tau-dependent):
+
+      - For gaps **shorter than tau_days**:
+          * the state is simply held (y_t = y_{t-1}) across missing x,
+            i.e., "hold y for short gaps".
+
+      - For gaps **longer than tau_days**:
+          * the entire gap is retroactively set to NaN.
+          * a tau-dependent stabilization window is applied after the gap.
+
+    Stabilization window length (after first valid and after long gaps)
+    is tied to tau of this series via get_stabilize_days(tau_days).
     """
     ntime = x.shape[0]
     y_store = np.full(ntime, np.nan, dtype=np.float32)
@@ -304,6 +261,14 @@ def exp_filter_ema_with_gap_1d(x, time_vals, tau_days):
     gap_start_idx = -1
     stabilize_left = 0
     has_seen_valid = False
+
+    # Tau-dependent gap threshold (in days, integer, at least 1)
+    if not np.isfinite(tau_days) or tau_days <= 0:
+        gap_threshold = 1
+    else:
+        gap_threshold = max(1, int(round(float(tau_days))))
+
+    stab_len_base = int(get_stabilize_days(tau_days))  # scalar int
 
     for t in range(ntime):
         if t == 0:
@@ -324,33 +289,36 @@ def exp_filter_ema_with_gap_1d(x, time_vals, tau_days):
             if gap_run == 1:
                 gap_start_idx = t
         else:
-            # If we were in a gap and it was long, start stabilization
-            if gap_run > GAP_THRESHOLD:
-                stabilize_left = STABILIZE_DAYS
+            # If we were in a gap and it was long (> gap_threshold), start stabilization
+            if gap_run > gap_threshold:
+                stabilize_left = stab_len_base
             gap_run = 0
             gap_start_idx = -1
 
-        # EMA update
+        # EMA update using Wagner form
         if np.isfinite(tau_days) and tau_days > 0 and is_valid_x:
-            K = dt_days / (max(tau_days, 1e-6) + dt_days)
+            dt = max(1.0, float(dt_days))
             if np.isnan(y_prev):
                 y_now = x_now
             else:
-                y_now = y_prev + K * (x_now - y_prev)
+                w = np.exp(-dt / max(tau_days, 1e-6))
+                y_now = w * y_prev + (1.0 - w) * x_now
         else:
-            # no valid tau or missing input -> carry previous state
+            # no valid tau or missing input -> carry previous state ("hold y")
             y_now = y_prev
 
         # First-ever valid
         if is_valid_x and not has_seen_valid:
             has_seen_valid = True
-            stabilize_left = STABILIZE_DAYS
+            stabilize_left = stab_len_base
 
         # Provisional write
         y_store[t] = y_now
 
-        # Long gap retroactive NaNs
-        if gap_run >= (GAP_THRESHOLD + 1) and gap_start_idx >= 0:
+        # Long gap retroactive NaNs:
+        # if we are still in the gap, and its length has exceeded gap_threshold,
+        # wipe the entire gap back to its start.
+        if gap_run >= (gap_threshold + 1) and gap_start_idx >= 0:
             y_store[gap_start_idx : (t + 1)] = np.nan
 
         # Stabilization NaNs
@@ -368,7 +336,7 @@ def exp_filter_ema_with_gap_1d(x, time_vals, tau_days):
 
 
 # ====================================================
-# Moving-window CDF helpers (replaces fixed monthly CDFs)
+# Moving-window CDF helpers (unchanged)
 # ====================================================
 
 MOVING_WINDOW_STEP_DAYS = 10  # fixed step asked by user
@@ -384,22 +352,7 @@ def _build_moving_window_cdfs_1d(
     exclude_mask=None,
 ):
     """
-    Build *climatological* moving-window CDFs for a 1D series.
-
-    Parameters
-    ----------
-    data_1d : (time,) float array
-    doys    : (time,) int array, day-of-year in [1, 366]
-    centers : (nwin,) int array, center DOYs for each window
-    obs_thresh : int, minimum #obs per window
-    nbins   : int, number of CDF bins
-    exclude_mask : optional (time,) bool, True = exclude from CDF estimation
-
-    Returns
-    -------
-    dict with:
-      "xr"   : (nwin, 1, nbins)
-      "cdf"  : (nwin, 1, nbins)
+    (Unused placeholder; kept for completeness.)
     """
     data_1d = np.asarray(data_1d, dtype=float)
     doys = np.asarray(doys, dtype=int)
@@ -416,27 +369,7 @@ def _build_moving_window_cdfs_1d(
     if not np.any(valid):
         return {"xr": xr, "cdf": cdf}
 
-    q = np.linspace(0.0, 1.0, nbins, dtype=np.float64)
-
-    for iw in range(nwin):
-        c = int(centers[iw])
-        diff = np.abs(doys - c)
-        diff_circ = np.minimum(diff, YEAR_LEN_FOR_DOY - diff)
-        sel = valid & (diff_circ <= (centers[1] - centers[0]) * 0.0)  # placeholder
-
-        # Actual selection: within half moving window length
-        # We'll derive half-window from neighbor delta or directly later.
-        # For clarity, we do it more explicitly outside this loop, see below.
-        pass
-
-    # Re-implement loop with explicit half-window (cleaner)
-    xr[:] = np.nan
-    cdf[:] = np.nan
-
-    # Derive half-window in days from spacing between centers if needed.
-    # But we really want an explicit half-window: (window_len_days / 2).
-    # We'll pass it via closure; see wrapper below. This function kept simple.
-
+    # real implementation handled in wrapper
     return {"xr": xr, "cdf": cdf}
 
 
@@ -450,7 +383,7 @@ def build_moving_window_cdfs_1d(
     exclude_mask=None,
 ):
     """
-    Wrapper: same idea as above but with explicit half-window length.
+    Build *climatological* moving-window CDFs for a 1D series.
     """
     data_1d = np.asarray(data_1d, dtype=float)
     doys = np.asarray(doys, dtype=int)
@@ -490,15 +423,6 @@ def build_moving_window_cdfs_1d(
 def build_window_index_for_time(doys, centers):
     """
     For each time index, find the index of the closest window center in circular DOY space.
-
-    Parameters
-    ----------
-    doys    : (time,) int, day-of-year
-    centers : (nwin,) int, window centers (DOY)
-
-    Returns
-    -------
-    win_idx_for_time : (time,) int array of window indices [0..nwin-1]
     """
     doys = np.asarray(doys, dtype=int)
     centers = np.asarray(centers, dtype=int)
@@ -510,14 +434,6 @@ def build_window_index_for_time(doys, centers):
 def _apply_qmap_series_mw(x_series, win_idx_for_time, gp, src_cdfs, ref_cdfs):
     """
     Moving-window quantile mapping for a 1D series and per-pixel CDFs.
-
-    Parameters
-    ----------
-    x_series        : (time,) array
-    win_idx_for_time: (time,) array of window indices
-    gp              : grid point index (here always 0 since we use 1x1 CDFs)
-    src_cdfs        : dict with "xr" and "cdf" arrays for source
-    ref_cdfs        : dict with "xr" and "cdf" arrays for reference
     """
     x_series = np.asarray(x_series, dtype=float)
     ntime = x_series.size
@@ -608,7 +524,7 @@ def write_daily_nc(path, lat1d, lon1d, time_val, sm2d, compress_level=4):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Optimize tau (using production gap/stab rules) and write daily CDF-matched SMAP RZMC NetCDFs (moving-window CDF)"
+        description="Optimize tau (using tau-dependent gap/stab rules and Wagner EMA) and write daily CDF-matched SMAP RZMC NetCDFs (moving-window CDF)"
     )
     p.add_argument(
         "--exp_folder",
@@ -661,8 +577,8 @@ def parse_args():
     p.add_argument(
         "--moving_window",
         type=int,
-        default=45,
-        help="Length of moving window in days for climatological CDF matching (default: 45).",
+        default=30,
+        help="Length of moving window in days for climatological CDF matching (default: 30).",
     )
     p.add_argument(
         "--compress",
@@ -727,7 +643,7 @@ def main():
     os.makedirs(os.path.join(expfilter_folder, args.outdir_timeseries), exist_ok=True)
 
     print("====================================================")
-    print("Tau optimization + daily RZMC writer (gap/stab-consistent, in-memory)")
+    print("Tau optimization + daily RZMC writer (gap/stab-consistent, Wagner EMA)")
     print("====================================================")
     print(f"Experiment folder : {exp_folder}")
     print(f"LIS input file    : {lis_input_file}")
@@ -1018,10 +934,10 @@ def main():
             rzmc_all[:, j, :] = rzmc_row
 
     else:
-        # NORMAL MODE: tau optimization with EMA + gap/stabilization and moving-window post-CDF
+        # NORMAL MODE: tau optimization with EMA + tau-dependent gap/stabilization and moving-window post-CDF
         taus = default_taus.copy()
         taus_used = taus
-        print("[TAU] Sweeping tau values and optimizing for Pearson R with moving-window CDF (using gap/stab EMA)...")
+        print("[TAU] Sweeping tau values and optimizing for Pearson R with moving-window CDF (using Wagner EMA + tau-dependent gap/stab)...")
 
         def _process_row(j):
             score_row = np.full(nlon, np.nan, dtype=np.float32)
@@ -1057,7 +973,7 @@ def main():
                 gp_dummy = 0
 
                 for tau in taus:
-                    # Filter with EMA + gap/stabilization 1D
+                    # Filter with EMA + tau-dependent gap/stabilization 1D (Wagner EMA)
                     xf = exp_filter_ema_with_gap_1d(x, time_vals, tau)
 
                     # Post-CDF (moving window, per-pixel)
@@ -1144,9 +1060,11 @@ def main():
             "title": "Max Pearson R and optimal exponential filter timescale",
             "description": (
                 "SMAP(surface) linearly bias-corrected to LIS(surface), exponentially "
-                "filtered with per-pixel tau using the same gap/stabilization policy "
-                "as the daily product, monthly CDF-matched to LIS(RZ) using "
-                f"a moving window of length {moving_window_days} days in day-of-year "
+                "filtered with per-pixel tau using a tau-dependent gap/stabilization "
+                "policy consistent with the daily product (short gaps < tau use hold-y; "
+                "long gaps > tau are fully masked with a tau-dependent stabilization "
+                "window), moving-window CDF-matched to LIS(RZ) using "
+                f"a window of length {moving_window_days} days in day-of-year "
                 f"space (step {MOVING_WINDOW_STEP_DAYS} days), then scored via Pearson "
                 "R vs LIS RZ. Root-zone selection always includes surface layer=1. "
                 "If RZ is exactly layer=1, tau is forced to 1e-6 without optimization."
@@ -1168,19 +1086,30 @@ def main():
     )
 
     nc_tau_path = os.path.join(
-        expfilter_folder, f"R_max_and_tau_opt_{args.rz_layers}.nc"
+        expfilter_folder, f"R_max_and_tau_opt_{args.rz_layers}_REVISED_tau_gap_holdY.nc"
     )
     out_ds_tau.to_netcdf(nc_tau_path)
     print(f"[TAU] -> Saved: {nc_tau_path}")
 
     # ====================================================
-    # PASS1: just write out the in-memory rzmc_all
+    # PASS1: write out the in-memory rzmc_all, with SMAP cross-mask
     # ====================================================
-    print("[DAILY][PASS1] Writing daily NetCDFs from in-memory filtered + CDF-matched array...")
+    print("[DAILY][PASS1] Writing daily NetCDFs from in-memory filtered + CDF-matched array (SMAP-masked)...")
 
     def write_one_day(t):
-        sm2d = rzmc_all[t, :, :]
-        out_path = make_out_name(os.path.join(args.expfilter_folder,args.outdir_timeseries), args.model, time_vals[t])
+        # Cross-mask with original SMAP: keep only timesteps where SMAP exists
+        valid_x_2d = np.isfinite(obs_np_raw[t, :, :])
+        if not valid_x_2d.any():
+            # No SMAP anywhere on this day -> skip writing this file
+            return t
+        sm2d = rzmc_all[t, :, :].copy()
+        sm2d[~valid_x_2d] = np.nan
+
+        out_path = make_out_name(
+            os.path.join(args.expfilter_folder, args.outdir_timeseries),
+            args.model,
+            time_vals[t],
+        )
         write_daily_nc(out_path, lats_range, lons_range, time_vals[t], sm2d, compress_level=args.compress)
         return t
 
@@ -1190,7 +1119,7 @@ def main():
         verbose=10,
     )(delayed(write_one_day)(t) for t in range(ntime))
 
-    print("[DONE] Tau optimization + daily RZMC NetCDFs written from in-memory 3D array.")
+    print("[DONE] Tau optimization + daily RZMC NetCDFs written from in-memory 3D array (SMAP-masked, tau-dependent gap policy).")
 
 
 if __name__ == "__main__":
