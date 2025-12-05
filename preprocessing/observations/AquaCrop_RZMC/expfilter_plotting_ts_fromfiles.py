@@ -267,7 +267,6 @@ def load_model_rz(exp_folder, lis_input_file, rz_layers, start_date, end_date,
     dc_ol = readers.lis_cube(
         output_dir,
         var="SoilMoist_tavg",
-        n_layers=12,
         lats=lats_range,
         lons=lons_range,
         start=start_date,

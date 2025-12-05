@@ -723,7 +723,6 @@ def main():
     dc_ol = readers.lis_cube(
         output_dir,
         var="SoilMoist_tavg",
-        n_layers=12,
         lats=lats_range,
         lons=lons_range,
         start=args.start_date,
