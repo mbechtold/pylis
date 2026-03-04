@@ -334,6 +334,67 @@ def exp_filter_ema_with_gap_1d(x, time_vals, tau_days):
 
     return y_store
 
+def exp_filter_ema_simple_1d(x, time_vals, tau_days):
+    """
+    Simple EMA using the Wagner SWI form, with *no* long-gap treatment or
+    stabilization window.
+
+        w = exp(-Δt / τ)
+        y_t = w * y_{t-1} + (1 - w) * x_t
+
+    - Missing x_t: hold the previous state (y_t = y_{t-1}).
+    - First valid x_t: y_t = x_t.
+    - At the end, all days with missing x are forced to NaN, so we do
+      not increase time resolution.
+
+    This is used in no_opt_tau_mode, where we do not want any long-gap
+    masking or stabilization.
+    """
+    x = np.asarray(x, dtype=float)
+    ntime = x.shape[0]
+    y = np.full(ntime, np.nan, dtype=np.float32)
+
+    y_prev = np.nan
+
+    for t in range(ntime):
+        if t == 0:
+            dt_days = 1.0
+        else:
+            dt_days = (
+                np.datetime64(time_vals[t], "D") - np.datetime64(time_vals[t - 1], "D")
+            ).astype(int)
+            dt_days = float(dt_days) if dt_days >= 1 else 1.0
+
+        x_now = x[t]
+        is_valid_x = np.isfinite(x_now)
+
+        if not np.isfinite(tau_days) or tau_days <= 0:
+            # degenerate case: just pass through with hold-y
+            if is_valid_x:
+                y_now = x_now
+            else:
+                y_now = y_prev
+        else:
+            if is_valid_x:
+                dt = max(1.0, float(dt_days))
+                if np.isnan(y_prev):
+                    y_now = x_now
+                else:
+                    w = np.exp(-dt / max(tau_days, 1e-6))
+                    y_now = w * y_prev + (1.0 - w) * x_now
+            else:
+                # hold previous state across missing x, but no extra masking
+                y_now = y_prev
+
+        y[t] = y_now
+        y_prev = y_now
+
+    # Enforce original SMAP missingness (same as in the gap-aware version)
+    missing = ~np.isfinite(x)
+    y[missing] = np.nan
+
+    return y
+
 
 # ====================================================
 # Moving-window CDF helpers (unchanged)
@@ -774,34 +835,43 @@ def main():
     print(f"[LAND] Number of land pixels: {n_land}")
 
     # ------------------------
+    # INACTIVE
     # Bias correction: SMAP(surface) -> LIS(surface)
     # ------------------------
-    print("[BIAS] Applying linear pre-filter bias correction...")
-    obs_bc_np = np.full_like(obs_np_raw, np.nan, dtype=np.float32)
+    # This was from earlier tests. It did not make a difference when first removing the bias in surface
+    # soil moisture and then applying the exponential filter, so this is turnt off and left if someone 
+    # wants to investigate this further
+    no_bias_correction = True
+    if no_bias_correction:
+        print("[BIAS] Skipping bias correction (using raw SMAP).")
+        obs_bc_np = obs_np_raw.copy().astype(np.float32)  # keep same dtype/shape
+    else:
+        print("[BIAS] Applying linear pre-filter bias correction...")
+        obs_bc_np = np.full_like(obs_np_raw, np.nan, dtype=np.float32)
 
-    def _bias_correct_row(j):
-        row_bc = np.full((ntime, nlon), np.nan, dtype=np.float32)
-        for i in range(nlon):
-            if not valid_land[j, i]:
-                continue
-            x = obs_np_raw[:, j, i]
-            r = lis_surf_np[:, j, i]
-            if np.isfinite(x).sum() < 3 or np.isfinite(r).sum() < 3:
-                row_bc[:, i] = x
-                continue
-            row_bc[:, i] = bias_correct_linear(x, r)
-        return j, row_bc
+        def _bias_correct_row(j):
+            row_bc = np.full((ntime, nlon), np.nan, dtype=np.float32)
+            for i in range(nlon):
+                if not valid_land[j, i]:
+                    continue
+                x = obs_np_raw[:, j, i]
+                r = lis_surf_np[:, j, i]
+                if np.isfinite(x).sum() < 3 or np.isfinite(r).sum() < 3:
+                    row_bc[:, i] = x
+                    continue
+                row_bc[:, i] = bias_correct_linear(x, r)
+            return j, row_bc
 
-    bc_results = Parallel(
-        n_jobs=_sanitize_n_jobs(args.n_jobs),
-        backend="loky",
-        verbose=10,
-    )(delayed(_bias_correct_row)(j) for j in range(nlat))
+        bc_results = Parallel(
+            n_jobs=_sanitize_n_jobs(args.n_jobs),
+            backend="loky",
+            verbose=10,
+        )(delayed(_bias_correct_row)(j) for j in range(nlat))
 
-    for j, row_bc in tqdm(bc_results, total=nlat, desc="[BIAS] Rows", leave=True):
-        obs_bc_np[:, j, :] = row_bc
+        for j, row_bc in tqdm(bc_results, total=nlat, desc="[BIAS] Rows", leave=True):
+            obs_bc_np[:, j, :] = row_bc
 
-    print("[BIAS] Done.")
+        print("[BIAS] Done.")
 
     # Time / DOY vectors for CDF mapping
     time_da = obs["time"]
@@ -888,7 +958,7 @@ def main():
                 )
 
                 tau = 1e-6
-                xf = exp_filter_ema_with_gap_1d(x, time_vals, tau)
+                xf = exp_filter_ema_simple_1d(x, time_vals, tau)
 
                 src_cdfs = build_moving_window_cdfs_1d(
                     xf,
